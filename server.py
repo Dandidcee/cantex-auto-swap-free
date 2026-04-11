@@ -355,7 +355,7 @@ async def run_account_bot(acc: dict):
                 log.error(f"[{name}] {e}")
                 return
 
-            _free_swap_last_date = ""
+            _free_swap_last_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             _free_swaps_done     = 0
 
             while True:
@@ -383,18 +383,12 @@ async def run_account_bot(acc: dict):
                 if free_swap_enabled and today_utc != _free_swap_last_date:
                     _free_swap_last_date = today_utc
                     _free_swaps_done     = 0
-                    log.info(f"[{name}] 🎁 Free swap quota reset — {free_swap_quota} free rounds available (00:00 UTC)")
-                    _set_account(name, last_msg=f"Free swap quota reset! Executing {free_swap_quota} free rounds now...")
+                    log.info(f"[{name}] 🎁 Free swap quota reset — {free_swap_quota} free swaps (00:00 UTC)")
+                    _set_account(name, last_msg=f"Free swap quota reset! Executing {free_swap_quota} free swaps now...")
 
-                    for free_round in range(1, free_swap_quota + 1):
+                    for free_n in range(1, free_swap_quota + 1):
                         if _get_account(name) is None or (_get_account(name) or {}).get("is_paused"):
                             break
-
-                        log.info(f"[{name}] 🎁 Free swap round {free_round}/{free_swap_quota} — no fee check")
-                        _set_account(name,
-                            status="running",
-                            phase=f"free swap {free_round}/{free_swap_quota}",
-                            last_msg=f"[FREE] Round {free_round}/{free_swap_quota}: fetching balances...")
 
                         try:
                             info  = await sdk.get_account_info()
@@ -408,90 +402,55 @@ async def run_account_bot(acc: dict):
                             break
 
                         if bal_a >= swap_amount_a:
-                            _set_account(name,
-                                phase=f"[FREE] {token_a.id} → {token_b.id} ({free_round}/{free_swap_quota})",
-                                last_msg=f"[FREE] Swapping {_fmt(swap_amount_a)} {token_a.id} (no fee)...")
-                            try:
-                                event = await sdk.swap_and_confirm(
-                                    sell_amount=swap_amount_a,
-                                    sell_instrument=token_a,
-                                    buy_instrument=token_b,
-                                    timeout=confirm_timeout,
-                                )
-                                out_amt = event.output_amount
-                                fee_amt = event.admin_fee_amount + event.liquidity_fee_amount
-                                log.info(f"[{name}] 🎁 Free A→B OK: got {out_amt} {token_b.id}, fee={fee_amt}")
-                                _set_account(name,
-                                    last_msg=f"[FREE] Got {_fmt(out_amt, token_b.id)} | fee={_fmt(fee_amt)}")
-                                write_log({
-                                    "acc": name, "pair": pair,
-                                    "action": f"{token_a.id}→{token_b.id}",
-                                    "amount": str(swap_amount_a), "out": str(out_amt),
-                                    "fee": str(fee_amt), "price": str(event.price),
-                                    "status": "SUCCESS", "note": "FREE_SWAP",
-                                })
-                                _set_account(name, swap_count=((_get_account(name) or {}).get("swap_count", 0) + 1))
-                                bal_b += out_amt
-                                bal_a -= swap_amount_a
-                            except Exception as e:
-                                log.warning(f"[{name}] Free A→B failed: {e}")
-                                _set_account(name, last_msg=f"[FREE] A→B failed: {e}")
+                            sell_inst, buy_inst = token_a, token_b
+                            sell_amt  = swap_amount_a
+                            direction = f"{token_a.id}→{token_b.id}"
+                        else:
+                            b_qty = bal_b.quantize(Decimal("0.000001"), rounding=ROUND_DOWN) if use_full_b else swap_amount_b_fixed
+                            if b_qty <= Decimal("0"):
+                                log.warning(f"[{name}] Free swap {free_n}: no balance, stopping.")
+                                break
+                            sell_inst, buy_inst = token_b, token_a
+                            sell_amt  = b_qty
+                            direction = f"{token_b.id}→{token_a.id}"
 
+                        log.info(f"[{name}] 🎁 Free swap {free_n}/{free_swap_quota}: {direction}")
                         _set_account(name,
-                            phase=f"[FREE] waiting {delay_a_to_b}s",
-                            last_msg=f"[FREE] Waiting {delay_a_to_b}s before swap back...")
-                        await asyncio.sleep(delay_a_to_b)
+                            status="running",
+                            phase=f"[FREE] {direction} ({free_n}/{free_swap_quota})",
+                            last_msg=f"[FREE] Swap {free_n}/{free_swap_quota}: {_fmt(sell_amt)} {sell_inst.id} (no fee)...")
 
                         try:
-                            info      = await sdk.get_account_info()
-                            bal_b_now = info.get_balance(token_b)
-                            _set_account(name, balB=_fmt(bal_b_now, token_b.id))
-                        except Exception:
-                            bal_b_now = Decimal("0")
-
-                        amount_b_free = (
-                            bal_b_now.quantize(Decimal("0.000001"), rounding=ROUND_DOWN)
-                            if use_full_b else swap_amount_b_fixed
-                        )
-
-                        if amount_b_free > Decimal("0"):
+                            event   = await sdk.swap_and_confirm(
+                                sell_amount=sell_amt,
+                                sell_instrument=sell_inst,
+                                buy_instrument=buy_inst,
+                                timeout=confirm_timeout,
+                            )
+                            out_amt = event.output_amount
+                            fee_amt = event.admin_fee_amount + event.liquidity_fee_amount
+                            log.info(f"[{name}] 🎁 Free swap {free_n} OK: {out_amt} {buy_inst.id}, fee={fee_amt}")
                             _set_account(name,
-                                phase=f"[FREE] {token_b.id} → {token_a.id} ({free_round}/{free_swap_quota})",
-                                last_msg=f"[FREE] Swapping {_fmt(amount_b_free)} {token_b.id} back (no fee)...")
-                            try:
-                                event = await sdk.swap_and_confirm(
-                                    sell_amount=amount_b_free,
-                                    sell_instrument=token_b,
-                                    buy_instrument=token_a,
-                                    timeout=confirm_timeout,
-                                )
-                                out_amt = event.output_amount
-                                fee_amt = event.admin_fee_amount + event.liquidity_fee_amount
-                                log.info(f"[{name}] 🎁 Free B→A OK: got {out_amt} {token_a.id}, fee={fee_amt}")
-                                _set_account(name,
-                                    last_msg=f"[FREE] Got {_fmt(out_amt, token_a.id)} back")
-                                write_log({
-                                    "acc": name, "pair": pair,
-                                    "action": f"{token_b.id}→{token_a.id}",
-                                    "amount": str(amount_b_free), "out": str(out_amt),
-                                    "fee": str(fee_amt), "price": str(event.price),
-                                    "status": "SUCCESS", "note": "FREE_SWAP",
-                                })
-                                _set_account(name, swap_count=((_get_account(name) or {}).get("swap_count", 0) + 1))
-                            except Exception as e:
-                                log.warning(f"[{name}] Free B→A failed: {e}")
-                                _set_account(name, last_msg=f"[FREE] B→A failed: {e}")
+                                last_msg=f"[FREE] {free_n}/{free_swap_quota} → {_fmt(out_amt, buy_inst.id)} | fee={_fmt(fee_amt)}")
+                            write_log({
+                                "acc": name, "pair": pair, "action": direction,
+                                "amount": str(sell_amt), "out": str(out_amt),
+                                "fee": str(fee_amt), "price": str(event.price),
+                                "status": "SUCCESS", "note": "FREE_SWAP",
+                            })
+                            _set_account(name, swap_count=((_get_account(name) or {}).get("swap_count", 0) + 1))
+                            _free_swaps_done += 1
+                        except Exception as e:
+                            log.warning(f"[{name}] Free swap {free_n} failed: {e}")
+                            _set_account(name, last_msg=f"[FREE] Swap {free_n} failed: {e}")
 
-                        _free_swaps_done += 1
-                        log.info(f"[{name}] 🎁 Free round {free_round}/{free_swap_quota} complete.")
-
-                        if free_round < free_swap_quota:
-                            await asyncio.sleep(5)
+                        if free_n < free_swap_quota:
+                            await asyncio.sleep(delay_a_to_b)
 
                     _set_account(name,
-                        last_msg=f"Free swaps done ({_free_swaps_done} rounds). Resuming normal loop...",
+                        last_msg=f"Free swaps done ({_free_swaps_done}/{free_swap_quota}). Resuming...",
                         phase="idle")
-                    log.info(f"[{name}] 🎁 All {_free_swaps_done} free swap rounds completed.")
+                    log.info(f"[{name}] 🎁 {_free_swaps_done}/{free_swap_quota} free swaps completed.")
 
                 try:
                     info  = await sdk.get_account_info()
