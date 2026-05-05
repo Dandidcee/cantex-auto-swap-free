@@ -51,6 +51,12 @@ BOT_INFO = {
     "credit":  "© 2026 Sojuu Community",
 }
 
+# ── Bot Mode ─────────────────────────────────────────────────────
+# "normal"    : mode biasa (CC ↔ USDCx, 2 arah)
+# "sell_only" : hanya sell CC → USDCx, 130 CC fixed per tx
+BOT_MODE           = "normal"   # diubah lewat CLI saat startup
+SELL_ONLY_AMOUNT   = Decimal("130")  # CC fixed per transaksi sell-only
+
 # ── App ──────────────────────────────────────────────────────────
 app = Flask(__name__, static_folder='.')
 CORS(app)
@@ -84,8 +90,6 @@ DEFAULT_CONFIG = {
     "delay_per_loop":     600,
     "max_slippage":       0.05,
     "confirm_timeout":    120.0,
-    "free_swap_count":    3,
-    "free_swap_enabled":  True,
 }
 
 # ── Auth ─────────────────────────────────────────────────────────
@@ -219,6 +223,96 @@ def read_logs(page=1, limit=25):
             pass
     return items, total
 
+
+def cc_daily_history(days: int = 30) -> list[dict]:
+    """
+    Compute per-day CC net change from swap_log.jsonl.
+
+    Each successful swap entry contains:
+      action  — e.g. "Amulet→USDCx"  (CC sold, USDCx received)
+                    or "USDCx→Amulet" (USDCx sold, CC received)
+      amount  — how much was *sold*
+      out     — how much was *received*
+
+    CC-related tokens: "Amulet", "CC" (both represent the CC token on Cantex)
+    USDCx-related token: "USDCx"
+
+    Returns a list OrderedDict per day (ascending), each with:
+      date        — "YYYY-MM-DD"
+      cc_in       — CC received (from USDCx→CC swaps)
+      cc_out      — CC sold (from CC→USDCx swaps)
+      net         — cc_in - cc_out   (positive = gained CC)
+      swap_count  — number of successful swaps that day
+    """
+    if not os.path.exists(LOG_FILE):
+        return []
+
+    CC_TOKENS = {"amulet", "cc"}
+
+    from collections import OrderedDict
+    day_data: dict[str, dict] = OrderedDict()
+
+    with open(LOG_FILE) as f:
+        lines = [l.strip() for l in f.readlines() if l.strip()]
+
+    for line in lines:
+        try:
+            e = json.loads(line)
+        except Exception:
+            continue
+
+        if e.get("status") != "SUCCESS":
+            continue
+
+        utc_str = e.get("utc", "")
+        try:
+            day = utc_str[:10]   # "YYYY-MM-DD"
+        except Exception:
+            continue
+
+        if not day:
+            continue
+
+        action = e.get("action", "")
+        # action format: "TokenA→TokenB"
+        parts = action.replace("→", "->").split("->")
+        if len(parts) != 2:
+            continue
+
+        sell_tok = parts[0].strip().lower()
+        buy_tok  = parts[1].strip().lower()
+
+        try:
+            amount = float(e.get("amount", 0))
+            out    = float(e.get("out",    0))
+        except Exception:
+            continue
+
+        if day not in day_data:
+            day_data[day] = {"date": day, "cc_in": 0.0, "cc_out": 0.0, "net": 0.0, "swap_count": 0}
+
+        d = day_data[day]
+        d["swap_count"] += 1
+
+        if sell_tok in CC_TOKENS:
+            # sold CC → out is USDCx
+            d["cc_out"] += amount
+        elif buy_tok in CC_TOKENS:
+            # sold USDCx → out is CC
+            d["cc_in"] += out
+
+    # compute net and round
+    result = []
+    for d in day_data.values():
+        d["cc_in"]  = round(d["cc_in"],  6)
+        d["cc_out"] = round(d["cc_out"], 6)
+        d["net"]    = round(d["cc_in"] - d["cc_out"], 6)
+        result.append(d)
+
+    # sort ascending, return last `days`
+    result.sort(key=lambda x: x["date"])
+    return result[-days:]
+
 # ── SSE ──────────────────────────────────────────────────────────
 def sse_push(data: dict):
     msg = f"data: {json.dumps(data)}\n\n"
@@ -313,6 +407,176 @@ def _resolve_pair(pools_info, pair: str):
     )
 
 
+async def run_account_bot_sell_only(acc: dict):
+    """
+    Mode SELL-ONLY: hanya menjual CC → USDCx dengan 130 CC fixed per tx.
+    Tidak ada swap balik. Loop terus sampai balance CC habis / paused / stopped.
+    """
+    name = acc["name"]
+    pair = "CC/USDCx"
+    cfg  = state["config"]
+
+    log.info(f"[{name}] [SELL-ONLY] Starting — sell 130 CC → USDCx per tx")
+    _set_account(name, status="starting", phase="[SELL-ONLY] initializing",
+                 last_msg="SELL-ONLY mode: 130 CC → USDCx per tx")
+
+    if not SDK_AVAILABLE:
+        # Demo loop sell-only
+        bal_a = 500.0
+        bal_b = 0.0
+        while True:
+            a = _get_account(name)
+            if not a:
+                break
+            if a.get("is_paused"):
+                _set_account(name, status="paused", phase="paused by user")
+                await asyncio.sleep(3)
+                continue
+            if bal_a < 130:
+                _set_account(name, status="stopped", phase="balance CC habis",
+                             last_msg=f"CC balance tidak cukup ({bal_a:.2f} CC < 130 CC)")
+                break
+            bal_a -= 130
+            bal_b += round(130 * random.uniform(1.40, 1.55), 4)
+            write_log({"acc": name, "pair": pair, "action": "Amulet→USDCx",
+                       "amount": "130", "out": str(bal_b), "fee": "0.05", "status": "SUCCESS"})
+            _set_account(name, swap_count=a.get("swap_count", 0) + 1,
+                         status="running", phase="CC → USDCx",
+                         last_msg=f"Sold 130 CC | bal CC={bal_a:.2f}",
+                         balA=f"{bal_a:.2f} Amulet", balB=f"{bal_b:.4f} USDCx",
+                         network_fee=f"{round(random.uniform(0.03, 0.08), 3)} CC")
+            delay_loop = int(cfg.get("delay_per_loop", 600))
+            await asyncio.sleep(delay_loop)
+        return
+
+    try:
+        operator = OperatorKeySigner.from_hex(acc["operator_key"])
+        intent   = IntentTradingKeySigner.from_hex(acc["trading_key"])
+        base_url = cfg.get("base_url", "https://api.cantex.io")
+
+        async with CantexSDK(operator, intent, base_url=base_url,
+                             api_key_path=f"secrets/api_key_{name}.txt") as sdk:
+
+            _set_account(name, phase="authenticating", last_msg="Authenticating...")
+            await sdk.authenticate()
+
+            admin_info = await sdk.get_account_admin()
+            if not admin_info.has_intent_account:
+                _set_account(name, phase="setup", last_msg="Creating intent account...")
+                await sdk.create_intent_trading_account()
+
+            _set_account(name, phase="resolving pair", last_msg="Looking up pool CC/USDCx...")
+            pools_info = await sdk.get_pool_info()
+            try:
+                token_a, token_b = _resolve_pair(pools_info, pair)
+                log.info(f"[{name}] [SELL-ONLY] Pair resolved: {token_a.id} → {token_b.id}")
+                _set_account(name, status="running", phase="idle",
+                             last_msg=f"SELL-ONLY: {token_a.id} → {token_b.id} | 130 CC/tx")
+            except ValueError as e:
+                _set_account(name, status="error", phase="error", last_msg=str(e))
+                log.error(f"[{name}] {e}")
+                return
+
+            while True:
+                a = _get_account(name)
+                if not a:
+                    break
+                if a.get("is_paused"):
+                    _set_account(name, status="paused", phase="paused by user")
+                    await asyncio.sleep(5)
+                    continue
+
+                max_fee         = Decimal(str(cfg.get("max_network_fee", 0.5)))
+                max_slippage    = Decimal(str(cfg.get("max_slippage", 0.05)))
+                delay_loop      = int(cfg.get("delay_per_loop", 600))
+                fee_check_iv    = int(cfg.get("fee_check_interval", 15))
+                confirm_timeout = float(cfg.get("confirm_timeout", 120.0))
+                sell_amount     = SELL_ONLY_AMOUNT  # 130 CC fixed
+
+                # Cek balance
+                try:
+                    info  = await sdk.get_account_info()
+                    bal_a = info.get_balance(token_a)
+                    bal_b = info.get_balance(token_b)
+                    _set_account(name,
+                        balA=_fmt(bal_a, token_a.id),
+                        balB=_fmt(bal_b, token_b.id),
+                        status="running",
+                    )
+                except Exception as e:
+                    _set_account(name, last_msg=f"Balance error: {e}")
+                    await asyncio.sleep(10)
+                    continue
+
+                if bal_a < sell_amount:
+                    _set_account(name,
+                        status="stopped", phase="CC balance tidak cukup",
+                        last_msg=f"CC ({_fmt(bal_a)}) < 130 — SELL-ONLY stopped")
+                    log.warning(f"[{name}] [SELL-ONLY] CC balance {bal_a} < 130. Stopping.")
+                    break
+
+                # Fee & slippage check
+                ok, net_fee = await _check_fee_and_slippage(
+                    sdk, token_a, token_b, sell_amount,
+                    max_fee, max_slippage, name, fee_check_iv)
+                if not ok:
+                    await asyncio.sleep(delay_loop)
+                    continue
+
+                _set_account(name,
+                    phase=f"[SELL-ONLY] {token_a.id} → {token_b.id}",
+                    last_msg=f"Selling {_fmt(sell_amount)} {token_a.id}...")
+                try:
+                    event = await sdk.swap_and_confirm(
+                        sell_amount=sell_amount,
+                        sell_instrument=token_a,
+                        buy_instrument=token_b,
+                        timeout=confirm_timeout,
+                    )
+                    out_amt        = event.output_amount
+                    net_fee_actual = event.admin_fee_amount + event.liquidity_fee_amount
+                    _set_account(name,
+                        last_msg=f"[SELL-ONLY] Got {_fmt(out_amt, token_b.id)} | fee={_fmt(net_fee_actual)}",
+                        swap_count=((_get_account(name) or {}).get("swap_count", 0) + 1),
+                    )
+                    write_log({
+                        "acc": name, "pair": pair, "mode": "sell_only",
+                        "action": f"{token_a.id}→{token_b.id}",
+                        "amount": str(sell_amount), "out": str(out_amt),
+                        "fee": str(net_fee_actual), "price": str(event.price),
+                        "status": "SUCCESS",
+                    })
+                except CantexTimeoutError:
+                    _set_account(name, last_msg=f"[SELL-ONLY] Swap timeout {confirm_timeout}s")
+                    write_log({"acc": name, "pair": pair, "mode": "sell_only",
+                               "action": f"{token_a.id}→{token_b.id}",
+                               "amount": str(sell_amount), "status": "TIMEOUT"})
+                    await asyncio.sleep(delay_loop)
+                    continue
+                except Exception as e:
+                    _set_account(name, last_msg=f"[SELL-ONLY] Swap failed: {e}")
+                    write_log({"acc": name, "pair": pair, "mode": "sell_only",
+                               "action": f"{token_a.id}→{token_b.id}",
+                               "amount": str(sell_amount), "status": "FAILED",
+                               "error": str(e)})
+                    await asyncio.sleep(delay_loop)
+                    continue
+
+                _set_account(name,
+                    phase=f"[SELL-ONLY] cooldown {delay_loop}s",
+                    last_msg=f"Next sell in {delay_loop}s")
+                await asyncio.sleep(delay_loop)
+
+    except asyncio.CancelledError:
+        _set_account(name, status="stopped", phase="—", last_msg="Bot stopped")
+    except CantexAuthError as e:
+        _set_account(name, status="error", last_msg=f"Auth error: {str(e)[:80]}")
+        log.error(f"[{name}] Auth error: {e}")
+    except Exception as e:
+        log.error(f"[{name}] [SELL-ONLY] Fatal error: {e}", exc_info=True)
+        _set_account(name, status="error", phase="error", last_msg=str(e)[:80])
+
+
 async def run_account_bot(acc: dict):
     name = acc["name"]
     pair = acc.get("pair", "CC/USDCx")
@@ -355,8 +619,6 @@ async def run_account_bot(acc: dict):
                 log.error(f"[{name}] {e}")
                 return
 
-            _free_swap_last_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            _free_swaps_done     = 0
 
             while True:
                 a = _get_account(name)
@@ -376,81 +638,6 @@ async def run_account_bot(acc: dict):
                 swap_amount_b_fixed = Decimal(str(cfg.get("swap_amount_b", 10.0)))
                 fee_check_iv        = int(cfg.get("fee_check_interval", 15))
                 confirm_timeout     = float(cfg.get("confirm_timeout", 120.0))
-                free_swap_enabled   = bool(cfg.get("free_swap_enabled", True))
-                free_swap_quota     = int(cfg.get("free_swap_count", 3))
-
-                today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-                if free_swap_enabled and today_utc != _free_swap_last_date:
-                    _free_swap_last_date = today_utc
-                    _free_swaps_done     = 0
-                    log.info(f"[{name}] 🎁 Free swap quota reset — {free_swap_quota} free swaps (00:00 UTC)")
-                    _set_account(name, last_msg=f"Free swap quota reset! Executing {free_swap_quota} free swaps now...")
-
-                    for free_n in range(1, free_swap_quota + 1):
-                        if _get_account(name) is None or (_get_account(name) or {}).get("is_paused"):
-                            break
-
-                        try:
-                            info  = await sdk.get_account_info()
-                            bal_a = info.get_balance(token_a)
-                            bal_b = info.get_balance(token_b)
-                            _set_account(name,
-                                balA=_fmt(bal_a, token_a.id),
-                                balB=_fmt(bal_b, token_b.id))
-                        except Exception as e:
-                            log.warning(f"[{name}] Free swap balance error: {e}")
-                            break
-
-                        if bal_a >= swap_amount_a:
-                            sell_inst, buy_inst = token_a, token_b
-                            sell_amt  = swap_amount_a
-                            direction = f"{token_a.id}→{token_b.id}"
-                        else:
-                            b_qty = bal_b.quantize(Decimal("0.000001"), rounding=ROUND_DOWN) if use_full_b else swap_amount_b_fixed
-                            if b_qty <= Decimal("0"):
-                                log.warning(f"[{name}] Free swap {free_n}: no balance, stopping.")
-                                break
-                            sell_inst, buy_inst = token_b, token_a
-                            sell_amt  = b_qty
-                            direction = f"{token_b.id}→{token_a.id}"
-
-                        log.info(f"[{name}] 🎁 Free swap {free_n}/{free_swap_quota}: {direction}")
-                        _set_account(name,
-                            status="running",
-                            phase=f"[FREE] {direction} ({free_n}/{free_swap_quota})",
-                            last_msg=f"[FREE] Swap {free_n}/{free_swap_quota}: {_fmt(sell_amt)} {sell_inst.id} (no fee)...")
-
-                        try:
-                            event   = await sdk.swap_and_confirm(
-                                sell_amount=sell_amt,
-                                sell_instrument=sell_inst,
-                                buy_instrument=buy_inst,
-                                timeout=confirm_timeout,
-                            )
-                            out_amt = event.output_amount
-                            fee_amt = event.admin_fee_amount + event.liquidity_fee_amount
-                            log.info(f"[{name}] 🎁 Free swap {free_n} OK: {out_amt} {buy_inst.id}, fee={fee_amt}")
-                            _set_account(name,
-                                last_msg=f"[FREE] {free_n}/{free_swap_quota} → {_fmt(out_amt, buy_inst.id)} | fee={_fmt(fee_amt)}")
-                            write_log({
-                                "acc": name, "pair": pair, "action": direction,
-                                "amount": str(sell_amt), "out": str(out_amt),
-                                "fee": str(fee_amt), "price": str(event.price),
-                                "status": "SUCCESS", "note": "FREE_SWAP",
-                            })
-                            _set_account(name, swap_count=((_get_account(name) or {}).get("swap_count", 0) + 1))
-                            _free_swaps_done += 1
-                        except Exception as e:
-                            log.warning(f"[{name}] Free swap {free_n} failed: {e}")
-                            _set_account(name, last_msg=f"[FREE] Swap {free_n} failed: {e}")
-
-                        if free_n < free_swap_quota:
-                            await asyncio.sleep(delay_a_to_b)
-
-                    _set_account(name,
-                        last_msg=f"Free swaps done ({_free_swaps_done}/{free_swap_quota}). Resuming...",
-                        phase="idle")
-                    log.info(f"[{name}] 🎁 {_free_swaps_done}/{free_swap_quota} free swaps completed.")
 
                 try:
                     info  = await sdk.get_account_info()
@@ -724,9 +911,16 @@ def start_account_task(acc: dict):
     old  = state["bot_tasks"].get(name)
     if old:
         loop.call_soon_threadsafe(old.cancel)
-    task = asyncio.run_coroutine_threadsafe(run_account_bot(acc), loop)
+    # Pilih coroutine berdasarkan mode global
+    if BOT_MODE == "sell_only":
+        coro = run_account_bot_sell_only(acc)
+        mode_label = "SELL-ONLY"
+    else:
+        coro = run_account_bot(acc)
+        mode_label = "NORMAL"
+    task = asyncio.run_coroutine_threadsafe(coro, loop)
     state["bot_tasks"][name] = task
-    log.info(f"[{name}] Task started — {BOT_INFO['name']} {BOT_INFO['product']}")
+    log.info(f"[{name}] Task started — {BOT_INFO['name']} {BOT_INFO['product']} [{mode_label} MODE]")
 
 def stop_account_task(name: str):
     task = state["bot_tasks"].pop(name, None)
@@ -993,9 +1187,24 @@ def swap_logs():
     items, total = read_logs(page, limit)
     return jsonify({"items": items, "total": total, "page": page})
 
+@app.route('/api/cc-history', methods=['GET'])
+def cc_history():
+    days = int(request.args.get("days", 30))
+    days = max(1, min(days, 365))
+    return jsonify({"history": cc_daily_history(days)})
+
 @app.route('/api/info', methods=['GET'])
 def bot_info():
     return jsonify(BOT_INFO)
+
+@app.route('/api/mode', methods=['GET'])
+def bot_mode():
+    mode_label = "SELL-ONLY (130 CC/tx)" if BOT_MODE == "sell_only" else "NORMAL (CC ↔ USDCx)"
+    return jsonify({
+        "mode":        BOT_MODE,
+        "mode_label":  mode_label,
+        "sell_amount": str(SELL_ONLY_AMOUNT) if BOT_MODE == "sell_only" else None,
+    })
 
 @app.route('/api/stats', methods=['GET'])
 def stats():
@@ -1036,6 +1245,7 @@ if __name__ == '__main__':
     load_accounts()
     load_auth()
 
+    # ── First-time auth setup ─────────────────────────────────────
     if not _auth['username'] or not _auth['password_hash']:
         print()
         print("=" * 52)
@@ -1073,17 +1283,61 @@ if __name__ == '__main__':
         print("=" * 52)
         print()
 
+    # ── Pilih Mode Bot ────────────────────────────────────────────
+    print()
+    print("╔══════════════════════════════════════════════════════╗")
+    print("║          SOJUU BOT — CANTEX V2                       ║")
+    print("║          Pilih Mode Operasi Bot                      ║")
+    print("╠══════════════════════════════════════════════════════╣")
+    print("║                                                      ║")
+    print("║  [1] Mode Normal   — Swap CC ↔ USDCx (2 arah)       ║")
+    print("║                      Amount dari config              ║")
+    print("║                                                      ║")
+    print("║  [2] Mode Sell-Only— Jual CC → USDCx SAJA           ║")
+    print("║                      Fixed 130 CC per transaksi      ║")
+    print("║                                                      ║")
+    print("╚══════════════════════════════════════════════════════╝")
+    print()
+
+    mode_choice = ""
+    while mode_choice not in ("1", "2"):
+        mode_choice = input("  Pilih mode [1/2] : ").strip()
+        if mode_choice not in ("1", "2"):
+            print("  ⚠  Masukkan 1 atau 2.")
+
+    if mode_choice == "2":
+        BOT_MODE = "sell_only"
+        print()
+        print("  ✓ Mode dipilih : SELL-ONLY (130 CC → USDCx per tx)")
+        print(f"  ✓ Jumlah akun  : {len(state['accounts'])} akun")
+        print()
+    else:
+        BOT_MODE = "normal"
+        print()
+        print("  ✓ Mode dipilih : NORMAL (CC ↔ USDCx, 2 arah)")
+        print(f"  ✓ Jumlah akun  : {len(state['accounts'])} akun")
+        print()
+
+    # Teruskan nilai ke fungsi-fungsi yang membutuhkan
+    import builtins
+    builtins.BOT_MODE = BOT_MODE  # expose ke module scope
+    # Update module-level variable
+    import sys
+    sys.modules[__name__].BOT_MODE = BOT_MODE
+
     if state["accounts"]:
-        log.info(f"Auto-starting {len(state['accounts'])} account(s)...")
+        log.info(f"Auto-starting {len(state['accounts'])} account(s) in [{BOT_MODE.upper()}] mode...")
         start_all()
 
     t = threading.Thread(target=_sse_broadcaster, daemon=True)
     t.start()
 
+    mode_str = "SELL-ONLY (130 CC/tx)" if BOT_MODE == "sell_only" else "NORMAL (CC ↔ USDCx)"
     log.info("=" * 54)
     log.info(f"  {BOT_INFO['name']} — {BOT_INFO['product']}")
     log.info(f"  {BOT_INFO['credit']}")
     log.info(f"  Network : {BOT_INFO['network']}")
+    log.info(f"  Mode    : {mode_str}")
     log.info(f"  Base URL: {state['config'].get('base_url')}")
     log.info(f"  Pairs   : {list(SUPPORTED_PAIRS.keys())}")
     log.info(f"  Accounts: {len(state['accounts'])} loaded")

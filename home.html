@@ -381,6 +381,32 @@ footer{border-top:1px solid var(--border);padding:24px 48px;display:flex;align-i
   padding:10px 14px;font-family:'Share Tech Mono',monospace;
   font-size:10px;letter-spacing:.1em;color:#f59e0b;
 }
+
+/* ── CC HISTORY ────────────────────────────────────────────── */
+.cc-hist-toolbar{display:flex;align-items:center;gap:10px;margin-bottom:20px;flex-wrap:wrap;}
+.cc-hist-toolbar label{font-family:'Share Tech Mono',monospace;font-size:10px;letter-spacing:.2em;color:var(--g-light);text-transform:uppercase;}
+.cc-hist-select{background:transparent;border:1px solid var(--border);color:#fff;font-family:'Share Tech Mono',monospace;font-size:11px;padding:7px 12px;cursor:pointer;outline:none;transition:border-color .2s;}
+.cc-hist-select:focus{border-color:rgba(255,255,255,.4);}
+.cc-hist-select option{background:#111;}
+.cc-summary-row{display:flex;gap:1px;background:var(--border);margin-bottom:24px;}
+.cc-sum-box{flex:1;background:#000;padding:18px 24px;display:flex;flex-direction:column;gap:4px;}
+.cc-sum-label{font-family:'Share Tech Mono',monospace;font-size:9px;letter-spacing:.3em;color:var(--g-light);text-transform:uppercase;}
+.cc-sum-val{font-family:'Bebas Neue',sans-serif;font-size:28px;letter-spacing:.05em;line-height:1;}
+.cc-sum-val.pos{color:var(--green);text-shadow:0 0 16px rgba(57,255,20,.3);}
+.cc-sum-val.neg{color:#ef4444;}
+.cc-chart-wrap{border:1px solid var(--border);padding:24px;margin-bottom:24px;position:relative;}
+.cc-chart-wrap-title{font-family:'Share Tech Mono',monospace;font-size:10px;letter-spacing:.3em;color:var(--g-light);text-transform:uppercase;margin-bottom:16px;}
+.cc-chart-canvas{height:220px;}
+.cc-table-wrap{overflow-x:auto;border:1px solid var(--border);}
+.cc-table{width:100%;border-collapse:collapse;}
+.cc-table th{font-family:'Share Tech Mono',monospace;font-size:9px;letter-spacing:.25em;color:var(--g-light);text-transform:uppercase;padding:12px 16px;border-bottom:1px solid var(--border);text-align:left;background:rgba(255,255,255,.02);}
+.cc-table td{padding:12px 16px;border-bottom:1px solid rgba(255,255,255,.04);font-family:'Rajdhani',sans-serif;font-size:14px;vertical-align:middle;}
+.cc-table tr:last-child td{border-bottom:none;}
+.cc-table tr:hover td{background:rgba(255,255,255,.02);}
+.cc-net-pos{color:var(--green);font-family:'Bebas Neue',sans-serif;font-size:16px;letter-spacing:.05em;}
+.cc-net-neg{color:#ef4444;font-family:'Bebas Neue',sans-serif;font-size:16px;letter-spacing:.05em;}
+.cc-net-zero{color:#555;font-family:'Bebas Neue',sans-serif;font-size:16px;}
+.cc-bar-label{font-family:'Share Tech Mono',monospace;font-size:9px;}
 </style>
 </head>
 <body>
@@ -445,6 +471,7 @@ footer{border-top:1px solid var(--border);padding:24px 48px;display:flex;align-i
   <ul class="sidebar-nav">
     <li><a id="snav-accounts" class="active" onclick="switchDash('accounts')">Overview</a></li>
     <li><a id="snav-swaplogs" onclick="switchDash('swaplogs')">Swap Log</a></li>
+    <li><a id="snav-cchistory" onclick="switchDash('cchistory')">CC History</a></li>
     <li><a id="snav-settings" onclick="switchDash('settings')">Settings</a></li>
   </ul>
   <div class="sidebar-footer">SOJUU CANTEX BOT — v2.0.0</div>
@@ -549,6 +576,54 @@ footer{border-top:1px solid var(--border);padding:24px 48px;display:flex;align-i
         </table>
       </div>
       <div class="pagination" id="swap-pagination"></div>
+    </div>
+
+    <!-- SUB: CC HISTORY -->
+    <div id="sub-cchistory" class="dash-sub">
+      <div class="dash-section-title">
+        <h2>CC Balance History</h2>
+        <span>Daily net change</span>
+        <button class="refresh-btn" onclick="loadCCHistory()">↻ Refresh</button>
+      </div>
+
+      <!-- toolbar -->
+      <div class="cc-hist-toolbar">
+        <label>Period:</label>
+        <select id="cc-days-select" class="cc-hist-select" onchange="loadCCHistory()">
+          <option value="7">7 Days</option>
+          <option value="14">14 Days</option>
+          <option value="30" selected>30 Days</option>
+          <option value="90">90 Days</option>
+        </select>
+      </div>
+
+      <!-- summary boxes -->
+      <div class="cc-summary-row" id="cc-summary-row">
+        <div class="cc-sum-box"><div class="cc-sum-label">Total CC In</div><div class="cc-sum-val pos" id="cc-total-in">—</div></div>
+        <div class="cc-sum-box"><div class="cc-sum-label">Total CC Out</div><div class="cc-sum-val neg" id="cc-total-out">—</div></div>
+        <div class="cc-sum-box"><div class="cc-sum-label">Net CC Change</div><div class="cc-sum-val" id="cc-total-net">—</div></div>
+        <div class="cc-sum-box"><div class="cc-sum-label">Days Active</div><div class="cc-sum-val" id="cc-days-active">—</div></div>
+      </div>
+
+      <!-- bar chart -->
+      <div class="cc-chart-wrap">
+        <div class="cc-chart-wrap-title">// Daily Net CC (green = gained, red = lost)</div>
+        <div class="cc-chart-canvas"><canvas id="cc-bar-chart"></canvas></div>
+      </div>
+
+      <!-- detail table -->
+      <div class="cc-table-wrap">
+        <table class="cc-table">
+          <thead><tr>
+            <th>Date (UTC)</th>
+            <th>CC Received ↑</th>
+            <th>CC Sold ↓</th>
+            <th>Net CC</th>
+            <th>Swaps</th>
+          </tr></thead>
+          <tbody id="cc-hist-tbody"><tr><td colspan="5" class="empty-state">Loading...</td></tr></tbody>
+        </table>
+      </div>
     </div>
 
     <!-- SUB: SETTINGS -->
@@ -725,7 +800,7 @@ const API = '';  // same origin — change to http://YOUR_VPS:5001 if needed
 let currentPage = 'home';
 let currentDash = 'accounts';
 let swapPage    = 1;
-let actChart = null, accChart = null;
+let actChart = null, accChart = null, ccBarChart = null;
 let sseSource = null, autoRefresh = null;
 let _isLoggedIn = false;
 
@@ -888,7 +963,7 @@ function gotoPage(id) {
 function openSidebar() { document.getElementById('sidebar').classList.add('open'); document.getElementById('sidebar-overlay').classList.add('show'); }
 function closeSidebar() { document.getElementById('sidebar').classList.remove('open'); document.getElementById('sidebar-overlay').classList.remove('show'); }
 function switchDash(id) {
-  ['accounts','swaplogs','settings'].forEach(s => {
+  ['accounts','swaplogs','cchistory','settings'].forEach(s => {
     document.getElementById('sub-'+s)?.classList.remove('active');
     document.getElementById('snav-'+s)?.classList.remove('active');
   });
@@ -896,8 +971,9 @@ function switchDash(id) {
   document.getElementById('snav-'+id)?.classList.add('active');
   currentDash = id;
   closeSidebar();
-  if (id === 'swaplogs') loadSwapLogs(1);
-  if (id === 'settings') loadSettings();
+  if (id === 'swaplogs')  loadSwapLogs(1);
+  if (id === 'settings')  loadSettings();
+  if (id === 'cchistory') loadCCHistory();
 }
 
 /* ── API ─────────────────────────────────── */
@@ -1122,6 +1198,115 @@ function renderPagination(id, total, cur, lim, cb) {
   for (let i=1; i<=Math.min(pages,8); i++)
     html += `<button class="page-btn ${i===cur?'active':''}" onclick="(${cb.name})(${i})">${i}</button>`;
   document.getElementById(id).innerHTML = html;
+}
+
+/* ── CC HISTORY ──────────────────────────── */
+async function loadCCHistory() {
+  const days = parseInt(document.getElementById('cc-days-select')?.value || '30');
+  const data = await apiFetch(`/api/cc-history?days=${days}`);
+  const list = data?.history || [];
+
+  // ─ summary aggregates ─
+  let totalIn  = 0, totalOut = 0;
+  list.forEach(d => { totalIn += d.cc_in; totalOut += d.cc_out; });
+  const totalNet   = totalIn - totalOut;
+  const daysActive = list.filter(d => d.swap_count > 0).length;
+
+  const fmt = v => v.toFixed(4);
+  const setEl = (id, txt) => { const el = document.getElementById(id); if (el) el.textContent = txt; };
+  const setClass = (id, cls) => { const el = document.getElementById(id); if (el) { el.className = 'cc-sum-val ' + cls; } };
+
+  setEl('cc-total-in',  fmt(totalIn)  + ' CC');
+  setEl('cc-total-out', fmt(totalOut) + ' CC');
+  setEl('cc-total-net', (totalNet >= 0 ? '+' : '') + fmt(totalNet) + ' CC');
+  setEl('cc-days-active', daysActive + ' days');
+  setClass('cc-total-net', totalNet >= 0 ? 'pos' : 'neg');
+
+  // ─ bar chart ─
+  const labels = list.map(d => d.date.slice(5));  // "MM-DD"
+  const nets   = list.map(d => d.net);
+  const colors = nets.map(v => v >= 0 ? 'rgba(57,255,20,0.75)' : 'rgba(239,68,68,0.75)');
+  const borderColors = nets.map(v => v >= 0 ? '#39ff14' : '#ef4444');
+
+  const ctx = document.getElementById('cc-bar-chart')?.getContext('2d');
+  if (ctx) {
+    if (ccBarChart) { ccBarChart.destroy(); ccBarChart = null; }
+    ccBarChart = new Chart(ctx, {
+      type: 'bar',
+      data: {
+        labels,
+        datasets: [{
+          label: 'Net CC',
+          data: nets,
+          backgroundColor: colors,
+          borderColor: borderColors,
+          borderWidth: 1,
+          borderRadius: 2,
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            backgroundColor: '#111',
+            borderColor: 'rgba(255,255,255,.15)',
+            borderWidth: 1,
+            titleFont: { family: "'Share Tech Mono', monospace", size: 10 },
+            bodyFont:  { family: "'Rajdhani', sans-serif", size: 13 },
+            callbacks: {
+              title: items => '📅 ' + items[0].label,
+              label: item => {
+                const d = list[item.dataIndex];
+                const sign = d.net >= 0 ? '+' : '';
+                return [
+                  ` Net : ${sign}${d.net.toFixed(4)} CC`,
+                  ` In  : +${d.cc_in.toFixed(4)} CC`,
+                  ` Out : -${d.cc_out.toFixed(4)} CC`,
+                  ` Swaps: ${d.swap_count}`,
+                ];
+              }
+            }
+          }
+        },
+        scales: {
+          x: {
+            grid: { color: 'rgba(255,255,255,.04)' },
+            ticks: { color: '#888', font: { family: "'Share Tech Mono', monospace", size: 9 } }
+          },
+          y: {
+            grid: { color: 'rgba(255,255,255,.06)' },
+            ticks: {
+              color: '#888',
+              font:  { family: "'Share Tech Mono', monospace", size: 9 },
+              callback: v => (v >= 0 ? '+' : '') + v.toFixed(2)
+            }
+          }
+        }
+      }
+    });
+  }
+
+  // ─ table (newest first) ─
+  const tbody = document.getElementById('cc-hist-tbody');
+  if (!tbody) return;
+  if (!list.length) {
+    tbody.innerHTML = '<tr><td colspan="5" class="empty-state">No data — run some swaps first</td></tr>';
+    return;
+  }
+  const rows = [...list].reverse();  // newest on top
+  tbody.innerHTML = rows.map(d => {
+    const netSign  = d.net > 0 ? '+' : '';
+    const netClass = d.net > 0 ? 'cc-net-pos' : d.net < 0 ? 'cc-net-neg' : 'cc-net-zero';
+    return `<tr>
+      <td style="font-family:'Share Tech Mono',monospace;font-size:11px">${d.date}</td>
+      <td style="color:var(--green);font-family:'Share Tech Mono',monospace;font-size:11px">+${d.cc_in.toFixed(4)}</td>
+      <td style="color:#ef4444;font-family:'Share Tech Mono',monospace;font-size:11px">-${d.cc_out.toFixed(4)}</td>
+      <td class="${netClass}">${netSign}${d.net.toFixed(4)}</td>
+      <td style="color:var(--g-light);font-family:'Share Tech Mono',monospace;font-size:10px">${d.swap_count}</td>
+    </tr>`;
+  }).join('');
 }
 
 /* ── SETTINGS ────────────────────────────── */
